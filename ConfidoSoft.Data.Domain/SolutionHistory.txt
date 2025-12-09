@@ -1,0 +1,5 @@
+﻿1) Install-Package Microsoft.AspNetCore.Identity (2.0.2)
+2) Install-Package Microsoft.AspNetCore.Identity.EntityFrameworkCore -Version 2.0.2
+3) Install-Package FluentValidation -Version 7.5.2
+4) Installing Newtonsoft.Json 11.0.1
+5) Install-Package Microsoft.EntityFrameworkCore.SqlServer

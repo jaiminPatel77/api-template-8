@@ -1,0 +1,14 @@
+﻿1) Install-Package Swashbuckle.AspNetCore -Version 5.0.0-rc5
+
+2) Installing NuGet package AutoMapper 
+
+3) nlog: https://github.com/NLog/NLog.Web/wiki/Getting-started-with-ASP.NET-Core-2
+	Install-Package NLog 
+	Install-Package NLog.Web.AspNetCore
+
+4) Install-Package Microsoft.AspNetCore.Identity.EntityFrameworkCore
+
+5) Install-Package System.IdentityModel.Tokens.Jwt -Version 5.6.0
+6) Install-Package Microsoft.IdentityModel.Protocols.OpenIdConnect -Version 5.6.0
+7) Install-Package Microsoft.AspNetCore.Authentication.JwtBearer -Version 3.1.0
+8) Install-Package Microsoft.AspNetCore.Mvc.NewtonsoftJson -Version 3.1.0

@@ -1,0 +1,9 @@
+﻿1) Installing NuGet package AutoMapper 6.2.2
+2) Install-Package FluentValidation -Version 7.5.2
+3) Install-Package Microsoft.AspNetCore.Identity (2.0.2)
+4) Install-Package Microsoft.AspNetCore.Identity.EntityFrameworkCore -Version 2.0.2
+5) Installing Newtonsoft.Json 11.0.1
+6) Install-Package System.IO.FileSystem
+7) Install-Package MailKit
+8) Removed FluentValidation -Version 7.5.2
+9) Added Install-Package Microsoft.AspNet.WebApi.Client for HttpClinetService.

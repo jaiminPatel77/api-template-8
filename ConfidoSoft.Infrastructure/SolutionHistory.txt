@@ -1,0 +1,2 @@
+﻿1) Installing NuGet package Microsoft.Extensions.Logging.Abstractions
+2) Install-Package System.IO.FileSystem

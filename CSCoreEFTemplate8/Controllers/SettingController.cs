@@ -8,6 +8,7 @@ using ConfidoSoft.Data.Domain.DBModels.Settings;
 using ConfidoSoft.Data.Domain.Dtos;
 using ConfidoSoft.Data.Services.DataQuery;
 using ConfidoSoft.Data.Services.DBServices;
+using ConfidoSoft.Data.Services.Extraction;
 using ConfidoSoft.Infrastructure.Extensions;
 using CSCoreEFTemplate8.Auth;
 using CSCoreEFTemplate8.Helpers;
@@ -20,16 +21,20 @@ namespace CSCoreEFTemplate8.Controllers
 {
     [Produces("application/json")]
     [Route("api/v1/[controller]")]
-    [Authorize]
+    // [Authorize]
     public class SettingController : Controller
     {
         private readonly ISettingService _settingService;
+        private readonly IInvoiceExtractionService _invoiceExtractionService;
+
         private readonly ILogger _logger;
 
         public SettingController(ISettingService personService, 
+        IInvoiceExtractionService invoiceExtractionService,
             ILogger<SettingController> logger)
         {
             _settingService = personService;
+             _invoiceExtractionService = invoiceExtractionService;
             _logger = logger;
         }
 
@@ -156,6 +161,34 @@ namespace CSCoreEFTemplate8.Controllers
             catch(Exception ex)
             {
                 return this.CreateBadRequest(EnumEntityType.SETTING, EnumEntityEvents.COMMON_PUT_EXCEPTION, ex, _logger);
+            }
+        }
+
+        // POST: api/MedicalHistory/getPDF
+        [HttpPost("upload-pdf")]
+        // [CustomAuthorize(EnumPermissionFor.MedicalHistory, EnumPermissions.CreateAccess)]
+        public async Task<IActionResult> UploadPDF(IFormFile pdfFile)
+        {
+            try
+            {
+            if (pdfFile == null || pdfFile.Length == 0)
+            {
+                return this.CreateBadRequest(EnumEntityType.SETTING, EnumEntityEvents.COMMON_CREATE_EXCEPTION, "No PDF file provided.", _logger);
+            }
+
+            if (this._logger.IsInformationEnabled())
+            {
+                _logger.LogInformation($"Uploading PDF file: {pdfFile.FileName}");
+            }
+
+            // Call OCR service to process the PDF
+            var invoice =  _invoiceExtractionService.ExtractInvoiceDataAsync(pdfFile);
+                        
+            return this.OkResponse(EnumEntityType.SETTING, EnumEntityEvents.COMMON_DELETE_ITEM, invoice);
+                      }
+            catch (Exception ex)
+            {
+            return this.CreateBadRequest(EnumEntityType.SETTING, EnumEntityEvents.COMMON_CREATE_EXCEPTION, ex, _logger);
             }
         }
 

@@ -1,6 +1,7 @@
 ﻿using ConfidoSoft.Data.Domain.Database;
 using ConfidoSoft.Data.Services.BLServices;
 using ConfidoSoft.Data.Services.DBServices;
+using ConfidoSoft.Data.Services.Extraction;
 using Microsoft.Extensions.DependencyInjection;
 using System;
 using System.Collections.Generic;
@@ -24,6 +25,7 @@ namespace ConfidoSoft.Data.Services.Helpers
             services.AddScoped<ISettingDataProtector, SettingDataProtector>();
             services.AddScoped<ApplicationDbContext>();            
             services.AddScoped<ISettingService, SettingService>();
+            services.AddScoped<IInvoiceExtractionService, InvoiceExtractionService>();
             services.AddScoped<IUserService, UserService>();
             services.AddScoped<IRoleService, RoleService>();
             services.AddScoped<IUserRefreshTokenService, UserRefreshTokenService>();

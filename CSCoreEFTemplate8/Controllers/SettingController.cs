@@ -182,7 +182,7 @@ namespace CSCoreEFTemplate8.Controllers
             }
 
             // Call OCR service to process the PDF
-            var invoice =  _invoiceExtractionService.ExtractInvoiceDataAsync(pdfFile);
+            var invoice =  _invoiceExtractionService.ProcessInvoice(pdfFile);
                         
             return this.OkResponse(EnumEntityType.SETTING, EnumEntityEvents.COMMON_DELETE_ITEM, invoice);
                       }

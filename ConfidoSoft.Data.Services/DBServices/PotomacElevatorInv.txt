@@ -1,0 +1,353 @@
+using ConfidoSoft.Data.Domain.Dtos;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+// Namespace matches your project structure
+namespace ConfidoSoft.Data.Services.Extraction
+{
+    public interface IInvoiceExtractionService
+    {
+      InvoiceDto ProcessInvoice(IFormFile jsonFile);
+    }
+
+    public class InvoiceExtractionService : IInvoiceExtractionService
+    {
+        
+     private const decimal LineTolerance = 5.0m;
+        private const decimal SplitLabelSpacingThreshold = 20.0m;
+
+        public InvoiceDto ProcessInvoice(IFormFile file)
+        {
+            ArgumentNullException.ThrowIfNull(file);
+
+            var pages = DeserializeFile(file);
+            if (pages is null || pages.Count == 0)
+            {
+                return new InvoiceDto();
+            }
+
+            var invoiceDto = new InvoiceDto
+            {
+                invoiceLineDetails = new List<InvoiceLineDetailsDto>()
+            };
+
+            // 1. Extract Header Data
+            foreach (var page in pages)
+            {
+                if (string.IsNullOrEmpty(invoiceDto.InvoiceNumber))
+                    invoiceDto.InvoiceNumber = ExtractInvoiceNumber(page.Words);
+
+                if (string.IsNullOrEmpty(invoiceDto.InvoiceDate))
+                    invoiceDto.InvoiceDate = ExtractInvoiceDate(page.Words);
+            }
+
+            // 2. Extract Table Data
+            var allProducts = new List<ProductDetailDto>();
+
+            foreach (var page in pages)
+            {
+                var pageProducts = ExtractTableFromPage(page.Words);
+                if (pageProducts.Any())
+                {
+                    allProducts.AddRange(pageProducts);
+                }
+            }
+
+            // 3. Final Aggregation
+            invoiceDto.TotalAmountDue = allProducts.Sum(p => p.TotalPrice ?? 0);
+
+            if (allProducts.Any())
+            {
+                invoiceDto.invoiceLineDetails.Add(new InvoiceLineDetailsDto
+                {
+                    item = "General",
+                    productDetails = allProducts
+                });
+            }
+
+            return invoiceDto;
+        }
+
+        private List<PageWords>? DeserializeFile(IFormFile file)
+        {
+            using var stream = file.OpenReadStream();
+            try
+            {
+                var options = new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                };
+                return JsonSerializer.Deserialize<List<PageWords>>(stream, options);
+            }
+            catch (JsonException)
+            {
+                return new List<PageWords>();
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Header Extraction Logic
+        // ---------------------------------------------------------
+
+        private string? ExtractInvoiceNumber(List<ExtractedWord> words)
+        {
+            for (int i = 0; i < words.Count - 2; i++)
+            {
+                var current = words[i];
+                var next = words[i + 1];
+
+                if (current.Text.Equals("Inv", StringComparison.OrdinalIgnoreCase) || 
+                    current.Text.Equals("Invoice", StringComparison.OrdinalIgnoreCase))
+                {
+                    bool isHashNext = next.Text == "#";
+                    bool isAdjacent = (next.x0 - current.x1) <= SplitLabelSpacingThreshold;
+
+                    if (isHashNext && isAdjacent)
+                    {
+                        var valueWord = words[i + 2];
+                        if (HasDigits(valueWord.Text))
+                        {
+                            return valueWord.Text;
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        private string? ExtractInvoiceDate(List<ExtractedWord> words)
+        {
+            for (int i = 0; i < words.Count - 1; i++)
+            {
+                var current = words[i];
+                if (current.Text.Equals("Date", StringComparison.OrdinalIgnoreCase))
+                {
+                    var next = words[i + 1];
+                    if (IsValidDate(next.Text))
+                    {
+                        return next.Text;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private bool HasDigits(string text) => text.Any(char.IsDigit);
+
+        private bool IsValidDate(string text)
+        {
+            string[] formats = { "M/d/yyyy", "MM/dd/yyyy", "M/d/yy", "MM/dd/yy", "yyyy-MM-dd" };
+            return DateTime.TryParseExact(text, formats, CultureInfo.InvariantCulture, DateTimeStyles.None, out _);
+        }
+
+        // ---------------------------------------------------------
+        // Table Extraction Logic
+        // ---------------------------------------------------------
+
+        private List<ProductDetailDto> ExtractTableFromPage(List<ExtractedWord> words)
+        {
+            var products = new List<ProductDetailDto>();
+            var sortedWords = words.OrderBy(w => w.top).ThenBy(w => w.x0).ToList();
+
+            var headers = FindTableHeaders(sortedWords);
+            if (headers is null) return products;
+
+            // --- FIXED BOUNDARY CALCULATIONS ---
+            decimal xQuanEnd = headers["Quan"].x1;
+            decimal xDescStart = headers["Description"].x0;
+            
+            // 1. Boundary: Quan | Desc
+            // Move closer to Quan to catch Description text that starts early/left
+            decimal boundaryQuanDesc = xQuanEnd + 15.0m; 
+
+            // 2. Boundary: Desc | Measure (CRITICAL FIX HERE)
+            // Description text spills far right. We cannot use the midpoint.
+            // We set the boundary just 5 pixels to the left of the "Measure" column start.
+            // This maximizes the space available for the Description.
+            decimal boundaryDescMeas = headers["Measure"].x0 - 5.0m;
+
+            decimal boundaryMeasPrice = (headers["Measure"].x1 + headers["Price"].x0) / 2;
+            decimal boundaryPriceAmt = (headers["Price"].x1 + headers["Amount"].x0) / 2;
+
+            decimal headerBottom = headers.Values.Max(h => h.bottom);
+            var tableContentWords = sortedWords
+                .Where(w => w.top > headerBottom)
+                .ToList();
+
+            var lines = GroupWordsIntoLines(tableContentWords);
+            ProductDetailDto? currentProduct = null;
+
+            foreach (var line in lines)
+            {
+                var lineText = string.Join(" ", line.Select(w => w.Text));
+                
+                // Map words to columns
+                var quanWords = new List<string>();
+                var descWords = new List<string>();
+                var measWords = new List<string>();
+                var priceWords = new List<string>();
+                var amtWords = new List<string>();
+
+                foreach (var word in line)
+                {
+                    decimal midX = (word.x0 + word.x1) / 2;
+
+                    if (midX < boundaryQuanDesc) quanWords.Add(word.Text);
+                    else if (midX < boundaryDescMeas) descWords.Add(word.Text);
+                    else if (midX < boundaryMeasPrice) measWords.Add(word.Text);
+                    else if (midX < boundaryPriceAmt) priceWords.Add(word.Text);
+                    else amtWords.Add(word.Text);
+                }
+
+                string quanStr = string.Join(" ", quanWords);
+                string descStr = string.Join(" ", descWords);
+                string measStr = string.Join(" ", measWords);
+                string priceStr = string.Join(" ", priceWords);
+                string amtStr = string.Join(" ", amtWords);
+
+                bool hasQuan = !string.IsNullOrWhiteSpace(quanStr);
+                bool hasPrice = !string.IsNullOrWhiteSpace(priceStr);
+                bool hasAmount = !string.IsNullOrWhiteSpace(amtStr);
+
+                // --- Page Break Logic ---
+                if (lineText.Contains("Account Number", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Only break if it's a footer (no price), otherwise treat as data
+                    if (!hasPrice && !hasAmount)
+                    {
+                        break;
+                    }
+                }
+
+                // --- Alignment Correction ---
+                // If text fell into "Quan" but isn't numeric, it's likely description text
+                if (hasQuan && !IsNumeric(quanStr))
+                {
+                    descStr = (quanStr + " " + descStr).Trim();
+                    quanStr = string.Empty;
+                    hasQuan = false;
+                }
+
+                // --- Junk Filtering ---
+                if (IsNonNumericJunk(quanStr) || IsNonNumericJunk(priceStr) || IsNonCurrencyJunk(amtStr))
+                {
+                    continue;
+                }
+
+                bool isNewProduct = hasQuan && hasPrice && hasAmount;
+                bool isDescriptionOnly = !hasQuan && !hasPrice && !hasAmount && !string.IsNullOrWhiteSpace(descStr);
+
+                if (isNewProduct)
+                {
+                    if (currentProduct != null) products.Add(currentProduct);
+
+                    currentProduct = new ProductDetailDto
+                    {
+                        Quantity = ParseDecimal(quanStr),
+                        ProductName = descStr,
+                        Unit = measStr,
+                        UnitPrice = ParseDecimal(priceStr),
+                        TotalPrice = ParseDecimal(amtStr)
+                    };
+                }
+                else if (isDescriptionOnly && currentProduct != null)
+                {
+                    currentProduct.ProductName += " " + descStr;
+                }
+            }
+
+            if (currentProduct != null)
+            {
+                products.Add(currentProduct);
+            }
+
+            return products;
+        }
+
+        private Dictionary<string, ExtractedWord>? FindTableHeaders(List<ExtractedWord> words)
+        {
+            var quanHeaders = words.Where(w => w.Text.Equals("Quan", StringComparison.OrdinalIgnoreCase)).ToList();
+
+            foreach (var quan in quanHeaders)
+            {
+                var lineWords = words.Where(w => Math.Abs(w.top - quan.top) <= LineTolerance).ToList();
+
+                var desc = lineWords.FirstOrDefault(w => w.Text.Equals("Description", StringComparison.OrdinalIgnoreCase));
+                var meas = lineWords.FirstOrDefault(w => w.Text.Equals("Measure", StringComparison.OrdinalIgnoreCase));
+                var price = lineWords.FirstOrDefault(w => w.Text.Equals("Price", StringComparison.OrdinalIgnoreCase));
+                var amt = lineWords.FirstOrDefault(w => w.Text.Equals("Amount", StringComparison.OrdinalIgnoreCase));
+
+                if (desc != null && meas != null && price != null && amt != null)
+                {
+                    return new Dictionary<string, ExtractedWord>
+                    {
+                        { "Quan", quan },
+                        { "Description", desc },
+                        { "Measure", meas },
+                        { "Price", price },
+                        { "Amount", amt }
+                    };
+                }
+            }
+            return null;
+        }
+
+        private List<List<ExtractedWord>> GroupWordsIntoLines(List<ExtractedWord> words)
+        {
+            var lines = new List<List<ExtractedWord>>();
+            var sorted = words.OrderBy(w => w.top).ToList();
+
+            while (sorted.Count > 0)
+            {
+                var seed = sorted[0];
+                var line = sorted.Where(w => Math.Abs(w.top - seed.top) <= LineTolerance)
+                                 .OrderBy(w => w.x0)
+                                 .ToList();
+
+                lines.Add(line);
+                foreach (var w in line) sorted.Remove(w);
+            }
+            return lines;
+        }
+
+        private bool IsNumeric(string text)
+        {
+            var clean = Regex.Replace(text, @"[^0-9.-]", "");
+            return decimal.TryParse(clean, NumberStyles.Any, CultureInfo.InvariantCulture, out _);
+        }
+
+        private bool IsNonNumericJunk(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string[] junk = { "NUMBER", "PRODUCT", "ORD", "CODE", "QTY" };
+            return junk.Contains(text.ToUpperInvariant());
+        }
+
+        private bool IsNonCurrencyJunk(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string[] junk = { "UNIT", "PRICE", "VALUE", "AMOUNT", "TOTAL" };
+            return junk.Contains(text.ToUpperInvariant());
+        }
+
+        private decimal? ParseDecimal(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var cleanText = Regex.Replace(text, @"[^0-9.-]", ""); 
+            if (decimal.TryParse(cleanText, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal result))
+            {
+                return result;
+            }
+            return null;
+        }
+    }
+}

@@ -1,0 +1,382 @@
+using ConfidoSoft.Data.Domain.Dtos;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+// Namespace matches your project structure
+namespace ConfidoSoft.Data.Services.Extraction
+{
+    public interface IInvoiceExtractionService
+    {
+      InvoiceDto ProcessInvoice(IFormFile jsonFile);
+    }
+
+    public class InvoiceExtractionService : IInvoiceExtractionService
+    {
+      public InvoiceDto ProcessInvoice(IFormFile file)
+        {
+            ArgumentNullException.ThrowIfNull(file);
+
+            List<PageWords>? pages;
+
+            // 1. JSON Deserialization
+            try
+            {
+                using var stream = file.OpenReadStream();
+                pages = JsonSerializer.Deserialize<List<PageWords>>(stream, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+            }
+            catch (JsonException)
+            {
+                // Return empty DTO or handle error as appropriate
+                return new InvoiceDto();
+            }
+
+            if (pages is null || pages.Count == 0)
+            {
+                return new InvoiceDto();
+            }
+
+            var invoiceDto = new InvoiceDto
+            {
+                invoiceLineDetails = new List<InvoiceLineDetailsDto>
+                {
+                    // Create a default group since input doesn't distinguish categories like "DRY"
+                    new InvoiceLineDetailsDto { item = "Service", productDetails = new List<ProductDetailDto>() }
+                }
+            };
+            
+            var productList = invoiceDto.invoiceLineDetails[0].productDetails!;
+            ProductDetailDto? lastProduct = null;
+
+            // 2. Iterate Pages
+            foreach (var page in pages)
+            {
+                if (page.Words is null || page.Words.Count == 0) continue;
+
+                // Sort words by vertical position (top) then horizontal (x0) to make processing linear
+                var words = page.Words.OrderBy(w => w.top).ThenBy(w => w.x0).ToList();
+
+                // ---------------------------------------------------------
+                // Header Key-Value Mapping (Split Labels)
+                // ---------------------------------------------------------
+
+                // Attempt to find Invoice Number
+                if (string.IsNullOrEmpty(invoiceDto.InvoiceNumber))
+                {
+                    var invoiceLabel = FindPhrase(words, "Invoice", "#");
+                    if (invoiceLabel != null)
+                    {
+                        // Search for values to the bottom (and horizontally aligned)
+                        var valueWord = FindValueBelow(words, invoiceLabel);
+                        if (valueWord != null)
+                        {
+                            invoiceDto.InvoiceNumber = valueWord.Text;
+                        }
+                    }
+                }
+
+                // Attempt to find Invoice Date
+                if (string.IsNullOrEmpty(invoiceDto.InvoiceDate))
+                {
+                    var dateLabel = FindPhrase(words, "Date");
+                    if (dateLabel != null)
+                    {
+                        var valueWord = FindValueBelow(words, dateLabel);
+                        if (valueWord != null)
+                        {
+                            invoiceDto.InvoiceDate = valueWord.Text;
+                        }
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // Table Extraction
+                // ---------------------------------------------------------
+                
+                // Locate Header Row: "Quantity", "Description", "Rate", "Amount"
+                var qtyHeader = words.FirstOrDefault(w => w.Text.Equals("Quantity", StringComparison.OrdinalIgnoreCase));
+                var descHeader = words.FirstOrDefault(w => w.Text.Equals("Description", StringComparison.OrdinalIgnoreCase));
+                var rateHeader = words.FirstOrDefault(w => w.Text.Equals("Rate", StringComparison.OrdinalIgnoreCase));
+                var amtHeader = words.FirstOrDefault(w => w.Text.Equals("Amount", StringComparison.OrdinalIgnoreCase));
+
+                // If not all headers found, skip page (Summary/Cover page logic)
+                if (qtyHeader == null || descHeader == null || rateHeader == null || amtHeader == null)
+                {
+                    continue;
+                }
+
+                // Define Column Boundaries based on headers
+                // Based on analysis: Description data ("PERFORM", x0=88) is very close to Quantity Header End (x1=77).
+                // We use a small buffer (+5) to separate Quantity column from Description.
+                decimal boundaryQtyDesc = qtyHeader.x1 + 5m; 
+                decimal boundaryDescRate = rateHeader.x0 - 10m;
+                decimal boundaryRateAmt = amtHeader.x0 - 10m;
+
+                // Group words into lines (Y-Tolerance +/- 5 pixels)
+                var lines = GroupWordsIntoLines(words);
+
+                // Start processing rows BELOW the headers
+                decimal headerBottom = Math.Max(Math.Max(qtyHeader.bottom, descHeader.bottom), 
+                                                Math.Max(rateHeader.bottom, amtHeader.bottom));
+
+                foreach (var line in lines)
+                {
+                    // Skip lines above or part of the header
+                    if (line.AverageTop <= headerBottom) continue;
+
+                    // Combine text in the line to check for keywords
+                    string fullLineText = string.Join(" ", line.Words.Select(w => w.Text));
+
+                    // Stop Condition: "Total" or "Overdue" logic
+                    bool hasTotal = fullLineText.Contains("Total", StringComparison.OrdinalIgnoreCase);
+                    bool hasOverdue = fullLineText.Contains("Overdue", StringComparison.OrdinalIgnoreCase);
+
+                    // Check if it's a pure total/break line (no other column text usually)
+                    // The requirement: "If a row contains... Total... stop reading table rows."
+                    if (hasTotal || hasOverdue)
+                    {
+                        // If "Total" found, extract the value next to it
+                        if (hasTotal && invoiceDto.TotalAmountDue == null)
+                        {
+                            var totalWord = line.Words.FirstOrDefault(w => w.Text.Equals("Total", StringComparison.OrdinalIgnoreCase));
+                            if (totalWord != null)
+                            {
+                                // Look for the next word in the same line
+                                var valueWord = line.Words.Where(w => w.x0 > totalWord.x1).OrderBy(w => w.x0).FirstOrDefault();
+                                if (valueWord != null)
+                                {
+                                    invoiceDto.TotalAmountDue = ParseCurrency(valueWord.Text);
+                                }
+                            }
+                        }
+                        // Stop processing rows on this page (and effectively the table)
+                        break; 
+                    }
+
+                    // ---------------------------------------------------------
+                    // Column Mapping
+                    // ---------------------------------------------------------
+                    var qtyWords = line.Words.Where(w => w.x1 <= boundaryQtyDesc).ToList();
+                    var descWords = line.Words.Where(w => w.x0 > boundaryQtyDesc && w.x1 <= boundaryDescRate).ToList();
+                    var rateWords = line.Words.Where(w => w.x0 > boundaryDescRate && w.x1 <= boundaryRateAmt).ToList();
+                    var amtWords = line.Words.Where(w => w.x0 > boundaryRateAmt).ToList();
+
+                    string qtyText = string.Join(" ", qtyWords.Select(w => w.Text));
+                    string descText = string.Join(" ", descWords.Select(w => w.Text));
+                    string rateText = string.Join(" ", rateWords.Select(w => w.Text));
+                    string amtText = string.Join(" ", amtWords.Select(w => w.Text));
+
+                    // ---------------------------------------------------------
+                    // Row Validation & Filtering
+                    // ---------------------------------------------------------
+
+                    bool isQtyEmpty = string.IsNullOrWhiteSpace(qtyText);
+                    bool isRateEmpty = string.IsNullOrWhiteSpace(rateText);
+                    bool isAmtEmpty = string.IsNullOrWhiteSpace(amtText);
+                    bool isDescEmpty = string.IsNullOrWhiteSpace(descText);
+
+                    // Logic: "Quantity" "Rate" "Amount" empty AND other fields missing -> Skip
+                    if (isQtyEmpty && isRateEmpty && isAmtEmpty && isDescEmpty) continue;
+
+                    // Check for invalid non-numeric/non-currency headers text appearing in data rows
+                    if (IsInvalidRow(qtyText, amtText)) continue;
+
+                    // ---------------------------------------------------------
+                    // Multi-Line Description Logic
+                    // ---------------------------------------------------------
+
+                    // If a row has words ONLY within the Description column AND no Qty/Rate/Amt
+                    if (!isDescEmpty && isQtyEmpty && isRateEmpty && isAmtEmpty)
+                    {
+                        if (lastProduct != null)
+                        {
+                            lastProduct.ProductName += " " + descText;
+                        }
+                        continue; // Processed as append, move to next line
+                    }
+
+                    // Otherwise, treat as new product row
+                    decimal? qtyVal = ParseDecimal(qtyText);
+                    decimal? rateVal = ParseCurrency(rateText);
+                    decimal? amtVal = ParseCurrency(amtText);
+
+                    var newProduct = new ProductDetailDto
+                    {
+                        ProductName = descText,
+                        Quantity = qtyVal,
+                        UnitPrice = rateVal,
+                        TotalPrice = amtVal,
+                        Unit = null // Not mapped in logic
+                    };
+
+                    productList.Add(newProduct);
+                    lastProduct = newProduct;
+                }
+            }
+
+            return invoiceDto;
+        }
+
+        // ==========================================
+        // Helper Methods
+        // ==========================================
+
+        /// <summary>
+        /// Groups raw words into lines based on Y-coordinate tolerance (+/- 5px).
+        /// </summary>
+        private List<LineGroup> GroupWordsIntoLines(List<ExtractedWord> words)
+        {
+            var lines = new List<LineGroup>();
+            // Using a copy to track processed words
+            var unprocessed = new List<ExtractedWord>(words);
+
+            while (unprocessed.Count > 0)
+            {
+                var anchor = unprocessed[0];
+                // Find all words that are vertically aligned with the anchor (within 5px)
+                var lineWords = unprocessed.Where(w => Math.Abs(w.top - anchor.top) <= 5).OrderBy(w => w.x0).ToList();
+
+                var lineGroup = new LineGroup
+                {
+                    Words = lineWords,
+                    AverageTop = lineWords.Average(w => w.top)
+                };
+                lines.Add(lineGroup);
+
+                // Remove processed words
+                foreach (var w in lineWords)
+                {
+                    unprocessed.Remove(w);
+                }
+            }
+            return lines.OrderBy(l => l.AverageTop).ToList();
+        }
+
+        /// <summary>
+        /// Finds a phrase consisting of one or two words (e.g., "Date" or "Invoice #").
+        /// Checks adjacency for two-word phrases: (next.x0 - current.x1) <= 20.
+        /// </summary>
+        private ExtractedWord? FindPhrase(List<ExtractedWord> words, string firstWord, string? secondWord = null)
+        {
+            for (int i = 0; i < words.Count; i++)
+            {
+                if (words[i].Text.Equals(firstWord, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (secondWord == null)
+                    {
+                        return words[i]; // Single word match
+                    }
+                    else
+                    {
+                        // Check next words for the second part
+                        for (int j = i + 1; j < words.Count; j++)
+                        {
+                            // Optimization: If Y diff is large, stop searching (not same line)
+                            if (Math.Abs(words[j].top - words[i].top) > 10) break;
+
+                            // Check proximity
+                            if (words[j].Text.Equals(secondWord, StringComparison.OrdinalIgnoreCase))
+                            {
+                                if ((words[j].x0 - words[i].x1) <= 20)
+                                {
+                                    // Return a synthetic bounding box covering the full phrase
+                                    return new ExtractedWord
+                                    {
+                                        Text = firstWord + " " + secondWord,
+                                        x0 = words[i].x0,
+                                        x1 = words[j].x1,
+                                        top = Math.Min(words[i].top, words[j].top),
+                                        bottom = Math.Max(words[i].bottom, words[j].bottom)
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Finds the value strictly BELOW the header label.
+        /// Logic: Looks for words in the next few lines that horizontally overlap with the label.
+        /// </summary>
+        private ExtractedWord? FindValueBelow(List<ExtractedWord> words, ExtractedWord labelBox)
+        {
+            // Filter words that are:
+            // 1. Below the label (top > label.top)
+            // 2. Not too far down (within ~40 pixels, approx 2-3 lines)
+            // 3. Horizontally aligned (overlap on X axis)
+            
+            var candidates = words.Where(w => 
+                w.top > labelBox.top && 
+                w.top < (labelBox.bottom + 50) &&
+                // Check horizontal overlap: Max(starts) < Min(ends)
+                Math.Max(w.x0, labelBox.x0) < Math.Min(w.x1, labelBox.x1)
+            ).OrderBy(w => w.top).ToList();
+
+            return candidates.FirstOrDefault();
+        }
+
+        private bool IsInvalidRow(string qtyText, string amtText)
+        {
+            // 1. Quantity and Amount field contains non-numeric text triggers (e.g., “NUMBER”, “PRODUCT”, “ORD”)
+            string[] numericBlockers = { "NUMBER", "PRODUCT", "ORD" };
+            if (numericBlockers.Any(b => qtyText.Contains(b, StringComparison.OrdinalIgnoreCase)) ||
+                numericBlockers.Any(b => amtText.Contains(b, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            // 2. Amount field contain non-currency text triggers (e.g., “UNIT”, “PRICE”, “VALUE”)
+            string[] currencyBlockers = { "UNIT", "PRICE", "VALUE" };
+            if (currencyBlockers.Any(b => amtText.Contains(b, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private decimal? ParseDecimal(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            // Remove generic noise characters if necessary, keeping digits and decimal point
+            var clean = Regex.Replace(text, @"[^0-9\.]", "");
+            if (decimal.TryParse(clean, out decimal result))
+            {
+                return result;
+            }
+            return null;
+        }
+
+        private decimal? ParseCurrency(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            // Remove currency symbols and commas
+            var clean = Regex.Replace(text, @"[^0-9\.]", "");
+            if (decimal.TryParse(clean, out decimal result))
+            {
+                return result;
+            }
+            return null;
+        }
+
+        private class LineGroup
+        {
+            public List<ExtractedWord> Words { get; set; } = new();
+            public decimal AverageTop { get; set; }
+        }
+    }
+}

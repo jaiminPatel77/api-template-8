@@ -1,0 +1,354 @@
+using ConfidoSoft.Data.Domain.Dtos;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+// Namespace matches your project structure
+namespace ConfidoSoft.Data.Services.Extraction
+{
+    public interface IInvoiceExtractionService
+    {
+        InvoiceDto ProcessInvoice(IFormFile jsonFile);
+    }
+
+    public class InvoiceExtractionService : IInvoiceExtractionService
+    {
+        private const decimal WordSpacingTolerance = 20m;
+        private const decimal LineYTolerance = 5m;
+
+        public InvoiceDto ProcessInvoice(IFormFile file)
+        {
+            ArgumentNullException.ThrowIfNull(file);
+
+            List<PageWords>? pages;
+
+            // 1. Deserialize JSON
+            using (var stream = file.OpenReadStream())
+            {
+                var options = new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                };
+                pages = JsonSerializer.Deserialize<List<PageWords>>(stream, options);
+            }
+
+            if (pages is null || pages.Count == 0)
+            {
+                throw new ArgumentException("The uploaded file contains no valid OCR data.");
+            }
+
+            var invoice = new InvoiceDto
+            {
+                invoiceLineDetails = new List<InvoiceLineDetailsDto>()
+            };
+
+            var defaultLineDetail = new InvoiceLineDetailsDto
+            {
+                item = "General",
+                productDetails = new List<ProductDetailDto>()
+            };
+            invoice.invoiceLineDetails.Add(defaultLineDetail);
+
+            // 2. Extract Headers (Invoice No, Date)
+            ExtractHeaders(pages, invoice);
+
+            // 3. Extract Table Data
+            ExtractTableData(pages, defaultLineDetail.productDetails);
+
+            // Calculate Total
+            if (defaultLineDetail.productDetails.Any())
+            {
+                invoice.TotalAmountDue = defaultLineDetail.productDetails.Sum(x => x.TotalPrice ?? 0);
+            }
+
+            return invoice;
+        }
+
+        private void ExtractHeaders(List<PageWords> pages, InvoiceDto invoice)
+        {
+            foreach (var page in pages)
+            {
+                var words = page.Words.OrderBy(w => w.top).ThenBy(w => w.x0).ToList();
+
+                for (int i = 0; i < words.Count - 1; i++)
+                {
+                    var current = words[i];
+
+                    if (current.Text.Equals("Invoice", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var next = words[i + 1];
+
+                        if ((next.x0 - current.x1) <= WordSpacingTolerance)
+                        {
+                            if (next.Text.Equals("date:", StringComparison.OrdinalIgnoreCase) && invoice.InvoiceDate == null)
+                            {
+                                var valueWord = GetNextValueWord(words, i + 1);
+                                if (valueWord != null && ContainsDigits(valueWord.Text))
+                                    invoice.InvoiceDate = valueWord.Text;
+                            }
+                            else if (next.Text.Equals("no.:", StringComparison.OrdinalIgnoreCase) && invoice.InvoiceNumber == null)
+                            {
+                                var valueWord = GetNextValueWord(words, i + 1);
+                                if (valueWord != null && ContainsDigits(valueWord.Text))
+                                    invoice.InvoiceNumber = valueWord.Text;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private ExtractedWord? GetNextValueWord(List<ExtractedWord> words, int keyEndIndex)
+        {
+            if (keyEndIndex + 1 < words.Count)
+            {
+                var keyWord = words[keyEndIndex];
+                var valueWord = words[keyEndIndex + 1];
+
+                if (Math.Abs(valueWord.top - keyWord.top) <= LineYTolerance)
+                {
+                    return valueWord;
+                }
+            }
+            return null;
+        }
+
+        private void ExtractTableData(List<PageWords> pages, List<ProductDetailDto> products)
+        {
+            ProductDetailDto? currentProduct = null;
+
+            foreach (var page in pages)
+            {
+                var words = page.Words.OrderBy(w => w.top).ThenBy(w => w.x0).ToList();
+
+                // 1. Find Table Headers
+                var headerMap = FindTableHeaders(words);
+                if (headerMap == null) continue;
+
+                // 2. Filter words strictly below the header line
+                decimal headerBottomY = headerMap.Values.Max(w => w.bottom);
+                var tableWords = words.Where(w => w.top > headerBottomY).ToList();
+
+                // 3. Group into Rows
+                var rows = GroupWordsByLine(tableWords);
+
+                // 4. Process Rows
+                foreach (var row in rows)
+                {
+                    if (IsStopRow(row, headerMap)) return;
+
+                    // Extract Columns
+                    string? idVal = ExtractColumnText(row, headerMap, "#");
+                    string? descVal = ExtractColumnText(row, headerMap, "Description");
+                    string? qtyVal = ExtractColumnText(row, headerMap, "Qty");
+                    string? rateVal = ExtractColumnText(row, headerMap, "Rate");
+                    string? amountVal = ExtractColumnText(row, headerMap, "Amount");
+
+                    // Validation
+                    bool hasAmount = !string.IsNullOrWhiteSpace(amountVal);
+                    bool amountIsCurrency = IsCurrency(amountVal);
+                    
+                    if (hasAmount && amountIsCurrency)
+                    {
+                        currentProduct = new ProductDetailDto
+                        {
+                            ProductID = idVal,
+                            ProductName = descVal,
+                            // UPDATED: Default to 1 if blank/invalid
+                            Quantity = ParseDecimal(qtyVal) ?? 1m, 
+                            // UPDATED: Default to 1 if blank/invalid
+                            UnitPrice = ParseDecimal(rateVal) ?? 1m, 
+                            TotalPrice = ParseDecimal(amountVal)
+                        };
+                        products.Add(currentProduct);
+                    }
+                    else
+                    {
+                        // Multi-line Description Append
+                        if (!string.IsNullOrWhiteSpace(descVal) && string.IsNullOrWhiteSpace(amountVal))
+                        {
+                            if (currentProduct != null)
+                            {
+                                currentProduct.ProductName += " " + descVal;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private Dictionary<string, ExtractedWord>? FindTableHeaders(List<ExtractedWord> words)
+        {
+            // We search for: "#", "Product", "Description", "Qty", "Rate", "Amount"
+            var hashHeader = words.FirstOrDefault(w => w.Text == "#");
+            var productHeader = words.FirstOrDefault(w => w.Text.StartsWith("Product", StringComparison.OrdinalIgnoreCase));
+            var descHeader = words.FirstOrDefault(w => w.Text == "Description");
+            var qtyHeader = words.FirstOrDefault(w => w.Text == "Qty");
+            var rateHeader = words.FirstOrDefault(w => w.Text == "Rate");
+            var amountHeader = words.FirstOrDefault(w => w.Text == "Amount");
+
+            // Valid table check: Must have # and Description roughly on same line
+            if (hashHeader != null && descHeader != null)
+            {
+                if (Math.Abs(hashHeader.top - descHeader.top) <= LineYTolerance)
+                {
+                    var map = new Dictionary<string, ExtractedWord>();
+                    map["#"] = hashHeader;
+                    map["Description"] = descHeader;
+                    
+                    // Add "Product" header if found (Critical for column boundary)
+                    if (productHeader != null && Math.Abs(hashHeader.top - productHeader.top) <= LineYTolerance)
+                        map["Product"] = productHeader;
+
+                    if (qtyHeader != null) map["Qty"] = qtyHeader;
+                    if (rateHeader != null) map["Rate"] = rateHeader;
+                    if (amountHeader != null) map["Amount"] = amountHeader;
+
+                    return map;
+                }
+            }
+            return null;
+        }
+
+        private List<List<ExtractedWord>> GroupWordsByLine(List<ExtractedWord> words)
+        {
+            var rows = new List<List<ExtractedWord>>();
+            if (!words.Any()) return rows;
+
+            var sorted = words.OrderBy(w => w.top).ToList();
+            var currentRow = new List<ExtractedWord> { sorted[0] };
+            rows.Add(currentRow);
+            
+            decimal currentLineTop = sorted[0].top;
+
+            for (int i = 1; i < sorted.Count; i++)
+            {
+                var word = sorted[i];
+                if (Math.Abs(word.top - currentLineTop) <= LineYTolerance)
+                {
+                    currentRow.Add(word);
+                }
+                else
+                {
+                    currentRow = new List<ExtractedWord> { word };
+                    rows.Add(currentRow);
+                    currentLineTop = word.top;
+                }
+            }
+
+            foreach(var row in rows) row.Sort((a, b) => a.x0.CompareTo(b.x0));
+            return rows;
+        }
+
+        private bool IsStopRow(List<ExtractedWord> row, Dictionary<string, ExtractedWord> headerMap)
+        {
+            bool hasStopWord = row.Any(w => 
+                w.Text.Equals("Total", StringComparison.OrdinalIgnoreCase) || 
+                w.Text.Equals("Overdue", StringComparison.OrdinalIgnoreCase));
+
+            if (!hasStopWord) return false;
+
+            // Ensure extracted columns are effectively empty or just contain the stop word
+            string idVal = ExtractColumnText(row, headerMap, "#");
+            string descVal = ExtractColumnText(row, headerMap, "Description");
+
+            if (string.IsNullOrWhiteSpace(idVal) && 
+               (string.IsNullOrWhiteSpace(descVal) || 
+                descVal.Contains("Total", StringComparison.OrdinalIgnoreCase) || 
+                descVal.Contains("Overdue", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+            return false;
+        }
+
+        private string ExtractColumnText(List<ExtractedWord> row, Dictionary<string, ExtractedWord> headerMap, string colName)
+        {
+            if (!headerMap.ContainsKey(colName)) return string.Empty;
+
+            var targetHeader = headerMap[colName];
+
+            decimal leftBound = targetHeader.x0 - 5;
+            decimal rightBound = 10000m; 
+
+            // =========================================================
+            // Dynamic Boundary Logic
+            // =========================================================
+            
+            if (colName == "#")
+            {
+                // CRITICAL FIX: 
+                // If "Product" header exists, use it as the hard right boundary for "#"
+                // This prevents "#" from eating "Commission" text.
+                if (headerMap.ContainsKey("Product"))
+                {
+                    rightBound = headerMap["Product"].x0;
+                }
+                else
+                {
+                     // Fallback: Use next known header
+                     var next = headerMap.Values.Where(h => h.x0 > targetHeader.x0).OrderBy(h => h.x0).FirstOrDefault();
+                     if (next != null) rightBound = next.x0;
+                }
+            }
+            else if (colName == "Description")
+            {
+                // CRITICAL FIX:
+                // Start Description capture from "Product" header if it exists.
+                // This ensures "Commission" (under Product header) is captured as Description.
+                if (headerMap.ContainsKey("Product"))
+                {
+                    leftBound = headerMap["Product"].x0 - 5;
+                }
+                
+                // Right bound for description is the next header (Qty or Rate)
+                var next = headerMap.Values.Where(h => h.x0 > targetHeader.x0).OrderBy(h => h.x0).FirstOrDefault();
+                if (next != null) rightBound = next.x0;
+            }
+            else
+            {
+                 // Default logic for Qty, Rate, Amount
+                 var next = headerMap.Values.Where(h => h.x0 > targetHeader.x0).OrderBy(h => h.x0).FirstOrDefault();
+                 if (next != null) rightBound = next.x0;
+            }
+
+            var colWords = row.Where(w => 
+            {
+                return w.x0 >= leftBound && w.x0 < rightBound;
+            }).ToList();
+
+            return string.Join(" ", colWords.Select(w => w.Text));
+        }
+
+        // =========================================================
+        // Helpers
+        // =========================================================
+
+        private bool ContainsDigits(string? text) => !string.IsNullOrEmpty(text) && text.Any(char.IsDigit);
+
+        private bool IsNumeric(string? text) => !string.IsNullOrWhiteSpace(text) && Regex.IsMatch(text, @"^[\d\.,]+$");
+
+        private bool IsCurrency(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            if (!text.Any(char.IsDigit)) return false;
+            if (text.Any(char.IsLetter)) return false;
+            return true;
+        }
+
+        private decimal? ParseDecimal(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var clean = Regex.Replace(text, @"[^\d\.-]", "");
+            return decimal.TryParse(clean, out decimal result) ? result : null;
+        }
+    }
+}

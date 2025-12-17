@@ -1,0 +1,387 @@
+using ConfidoSoft.Data.Domain.Dtos;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+// Namespace matches your project structure
+namespace ConfidoSoft.Data.Services.Extraction
+{
+    public interface IInvoiceExtractionService
+    {
+        InvoiceDto ProcessInvoice(IFormFile jsonFile);
+    }
+
+    public class InvoiceExtractionService : IInvoiceExtractionService
+    {
+      private const decimal LineYTolerance = 6.0m;
+        private const decimal PhraseGapTolerance = 25.0m;
+        private const decimal ColumnPadding = 15.0m;
+
+        public InvoiceDto ProcessInvoice(IFormFile file)
+        {
+            ArgumentNullException.ThrowIfNull(file);
+
+            List<PageWords>? pages;
+
+            // 1. Deserialize JSON
+            try
+            {
+                using var stream = file.OpenReadStream();
+                pages = JsonSerializer.Deserialize<List<PageWords>>(stream, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Failed to process input file. Ensure it is valid JSON.", ex);
+            }
+
+            if (pages is null || pages.Count == 0) return new InvoiceDto();
+
+            var invoiceDto = new InvoiceDto
+            {
+                invoiceLineDetails = new List<InvoiceLineDetailsDto>()
+            };
+
+            var defaultSection = new InvoiceLineDetailsDto
+            {
+                item = "General",
+                productDetails = new List<ProductDetailDto>()
+            };
+
+            // 2. Process Pages
+            foreach (var page in pages)
+            {
+                if (page.Words is null || page.Words.Count == 0) continue;
+
+                // --- Global Header Extraction ---
+                // We check every page because header info might appear on any page or repeated.
+                if (string.IsNullOrEmpty(invoiceDto.InvoiceNumber))
+                {
+                    invoiceDto.InvoiceNumber = FindValueBelowPhrase(page.Words, "INVOICE", "NUMBER");
+                }
+
+                if (string.IsNullOrEmpty(invoiceDto.InvoiceDate))
+                {
+                    invoiceDto.InvoiceDate = FindValueBelowPhrase(page.Words, "DELV.", "DATE");
+                }
+
+                // --- Table Extraction ---
+                
+                // 1. Identify Columns
+                var columnMap = IdentifyTableColumns(page.Words);
+
+                // Requirement: Skip page if "QTY, ITEM DESCRIPTION" headers are not found
+                if (!columnMap.HasValidMapping) continue;
+
+                // 2. Group words into lines
+                var lines = GroupWordsIntoLines(page.Words);
+                
+                bool groupTotalFound = false;
+
+                foreach (var line in lines)
+                {
+                    // Sort words left-to-right
+                    line.Sort((a, b) => a.x0.CompareTo(b.x0));
+                    var lineText = string.Join(" ", line.Select(w => w.Text));
+
+                    // Requirement: Stop if "OPEN:" is found in a summary line
+                    if (line.Any(w => w.Text.Contains("OPEN:", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        break;
+                    }
+
+                    // Requirement: Start processing ONLY after "GROUP TOTAL****" is found.
+                    // We also explicitly skip the "GROUP TOTAL" row itself.
+                    bool isGroupTotalRow = lineText.Contains("GROUP", StringComparison.OrdinalIgnoreCase) && 
+                                           lineText.Contains("TOTAL", StringComparison.OrdinalIgnoreCase);
+
+                    if (isGroupTotalRow)
+                    {
+                        groupTotalFound = true;
+                        continue; // Skip the header/total row itself
+                    }
+
+                    if (!groupTotalFound) continue;
+
+                    // 3. Map Row
+                    var product = MapRowToProduct(line, columnMap);
+
+                    // 4. Validate
+                    if (IsValidProductRow(product))
+                    {
+                        defaultSection.productDetails?.Add(product!);
+                    }
+                }
+            }
+
+            if (defaultSection.productDetails?.Any() == true)
+            {
+                invoiceDto.invoiceLineDetails.Add(defaultSection);
+                
+                // Calculate Total Amount if not extracted from header
+                if (invoiceDto.TotalAmountDue == null)
+                {
+                    invoiceDto.TotalAmountDue = defaultSection.productDetails.Sum(x => x.TotalPrice ?? 0);
+                }
+            }
+
+            return invoiceDto;
+        }
+
+        // ---------------------------------------------------------
+        // Header Finder Logic
+        // ---------------------------------------------------------
+
+        private string? FindValueBelowPhrase(List<ExtractedWord> words, string part1, string part2)
+        {
+            // Filter candidates for the first part of the phrase (e.g., "INVOICE")
+            var candidates = words.Where(w => w.Text.Equals(part1, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            foreach (var w1 in candidates)
+            {
+                // Look for Part 2 (e.g., "NUMBER") to the right
+                var w2 = words.FirstOrDefault(w =>
+                    w != w1 &&
+                    w.x0 > w1.x1 &&
+                    (w.x0 - w1.x1) <= PhraseGapTolerance &&
+                    Math.Abs(w.MidY - w1.MidY) <= LineYTolerance &&
+                    w.Text.Equals(part2, StringComparison.OrdinalIgnoreCase));
+
+                if (w2 != null)
+                {
+                    // Phrase Found. Define search zone below it.
+                    // We allow a wider X-search to catch values that are slightly offset (left or right).
+                    decimal phraseLeft = w1.x0 - 20; 
+                    decimal phraseRight = w2.x1 + 20;
+                    decimal searchTop = Math.Max(w1.y1, w2.y1);
+                    decimal searchBottom = searchTop + 100; // Look down 100px
+
+                    var valueWord = words
+                        .Where(w => w.y0 > searchTop && w.y0 < searchBottom)
+                        // Check if the word overlaps horizontally with the header phrase
+                        .Where(w => w.x1 > phraseLeft && w.x0 < phraseRight)
+                        .OrderBy(w => w.y0) // Closest one below
+                        .FirstOrDefault();
+
+                    if (valueWord != null)
+                    {
+                        return valueWord.Text;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        // ---------------------------------------------------------
+        // Table Column Logic
+        // ---------------------------------------------------------
+
+        private class ColumnMapping
+        {
+            public bool HasValidMapping { get; set; }
+            public (decimal Start, decimal End)? PackCol { get; set; }
+            public (decimal Start, decimal End)? DescriptionCol { get; set; }
+            public (decimal Start, decimal End)? CodeCol { get; set; }
+            public (decimal Start, decimal End)? QtyCol { get; set; }
+            public (decimal Start, decimal End)? UnitPriceCol { get; set; }
+            public (decimal Start, decimal End)? TotalPriceCol { get; set; }
+        }
+
+        private ColumnMapping IdentifyTableColumns(List<ExtractedWord> words)
+        {
+            var mapping = new ColumnMapping();
+
+            // Analyze only the top portion of the page for headers (e.g., top 300px)
+            var headerWords = words.Where(w => w.y0 < 300).ToList();
+
+            // 1. Locate Anchors
+            var qtyWord = headerWords.FirstOrDefault(w => w.Text.Equals("QTY", StringComparison.OrdinalIgnoreCase));
+            var descWord = headerWords.FirstOrDefault(w => w.Text.Contains("DESCRIPTION", StringComparison.OrdinalIgnoreCase));
+
+            // Essential requirement: Qty and Description must exist
+            if (qtyWord == null || descWord == null) return mapping;
+
+            mapping.HasValidMapping = true;
+
+            // QTY Column
+            mapping.QtyCol = (qtyWord.x0 - ColumnPadding, qtyWord.x1 + ColumnPadding);
+
+            // Pack Size Column (To exclude "110 LB" from Description)
+            // Look for "PACK" and "SIZE"
+            var packWord = headerWords.FirstOrDefault(w => w.Text.Equals("PACK", StringComparison.OrdinalIgnoreCase));
+            var sizeWord = headerWords.FirstOrDefault(w => w.Text.Equals("SIZE", StringComparison.OrdinalIgnoreCase));
+            
+            if (packWord != null && sizeWord != null)
+            {
+                // Define Pack column covering both words
+                decimal pStart = Math.Min(packWord.x0, sizeWord.x0) - ColumnPadding;
+                decimal pEnd = Math.Max(packWord.x1, sizeWord.x1) + ColumnPadding;
+                mapping.PackCol = (pStart, pEnd);
+            }
+
+            // Code Column
+            var codeWord = headerWords.FirstOrDefault(w => w.Text.Equals("CODE", StringComparison.OrdinalIgnoreCase));
+            if (codeWord != null)
+            {
+                mapping.CodeCol = (codeWord.x0 - ColumnPadding, codeWord.x1 + ColumnPadding);
+            }
+
+            // Unit Price Column
+            // Handle stacked headers "UNIT" over "PRICE"
+            var unitWord = headerWords.FirstOrDefault(w => w.Text.Equals("UNIT", StringComparison.OrdinalIgnoreCase));
+            var priceWord = headerWords.FirstOrDefault(w => w.Text.Equals("PRICE", StringComparison.OrdinalIgnoreCase));
+            
+            // Prefer "PRICE" as anchor, ensure it's to the right of "CODE" if code exists
+            if (priceWord != null && (codeWord == null || priceWord.x0 > codeWord.x0))
+            {
+                mapping.UnitPriceCol = (priceWord.x0 - ColumnPadding, priceWord.x1 + ColumnPadding);
+            }
+
+            // Total Price / Extended Price
+            var extWord = headerWords.FirstOrDefault(w => w.Text.StartsWith("EXTENDED", StringComparison.OrdinalIgnoreCase));
+            if (extWord != null)
+            {
+                mapping.TotalPriceCol = (extWord.x0 - ColumnPadding, extWord.x1 + 60);
+            }
+
+            // Description Column
+            // It lies between the end of Pack/Qty and the start of Code.
+            decimal descStart = mapping.PackCol.HasValue ? mapping.PackCol.Value.End : mapping.QtyCol.Value.End;
+            decimal descEnd = mapping.CodeCol.HasValue ? mapping.CodeCol.Value.Start : (descWord.x1 + 100);
+
+            mapping.DescriptionCol = (descStart, descEnd);
+
+            return mapping;
+        }
+
+        private ProductDetailDto? MapRowToProduct(List<ExtractedWord> row, ColumnMapping map)
+        {
+            var product = new ProductDetailDto();
+            var descParts = new List<string>();
+            var unitParts = new List<string>();
+
+            foreach (var word in row)
+            {
+                decimal mx = word.MidX;
+
+                if (IsInside(mx, map.CodeCol))
+                {
+                    product.ProductID = word.Text;
+                }
+                else if (IsInside(mx, map.QtyCol))
+                {
+                    if (decimal.TryParse(word.Text, out var q)) product.Quantity = q;
+                }
+                else if (IsInside(mx, map.UnitPriceCol))
+                {
+                    if (TryParseCurrency(word.Text, out var p)) product.UnitPrice = p;
+                }
+                else if (IsInside(mx, map.TotalPriceCol))
+                {
+                    if (TryParseCurrency(word.Text, out var t)) product.TotalPrice = t;
+                }
+                else if (IsInside(mx, map.DescriptionCol))
+                {
+                    descParts.Add(word.Text);
+                }
+                else if (IsInside(mx, map.PackCol))
+                {
+                    // If word falls in Pack column (e.g. "110", "LB"), add to Unit or ignore.
+                    // Requirement: "map to Unit"? Requirement didn't specify, but often useful.
+                    unitParts.Add(word.Text);
+                }
+            }
+
+            if (descParts.Count > 0)
+            {
+                product.ProductName = string.Join(" ", descParts);
+            }
+            if (unitParts.Count > 0)
+            {
+                product.Unit = string.Join(" ", unitParts);
+            }
+
+            return product;
+        }
+
+        private bool IsValidProductRow(ProductDetailDto? product)
+        {
+            if (product == null) return false;
+
+            // 1. Must have ProductName or ID
+            if (string.IsNullOrWhiteSpace(product.ProductName) && string.IsNullOrWhiteSpace(product.ProductID))
+                return false;
+
+            // 2. Reject "Group Total" or header rows that slipped through
+            // (Double check in case logic missed the skip)
+            if (product.ProductName != null && product.ProductName.Contains("TOTAL", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // 3. Reject Code column noise
+            if (!string.IsNullOrEmpty(product.ProductID))
+            {
+                if (IsNoise(product.ProductID)) return false;
+            }
+
+            // 4. Must have at least one numeric value (Qty, UnitPrice, or Total) to be a valid line item
+            if (product.Quantity == null && product.UnitPrice == null && product.TotalPrice == null)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool IsNoise(string text)
+        {
+            var noise = new[] { "CODE", "ITEM", "PRICE", "UNIT", "EXTENDED", "PAGE", "TOTAL", "GROUP", "SUB", "TAX" };
+            return noise.Any(n => text.Contains(n, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private bool IsInside(decimal x, (decimal Start, decimal End)? range)
+        {
+            if (!range.HasValue) return false;
+            return x >= range.Value.Start && x <= range.Value.End;
+        }
+
+        private bool TryParseCurrency(string text, out decimal value)
+        {
+            var clean = text.Replace("$", "").Replace(",", "").Trim();
+            return decimal.TryParse(clean, out value);
+        }
+
+        private List<List<ExtractedWord>> GroupWordsIntoLines(List<ExtractedWord> words)
+        {
+            var lines = new List<List<ExtractedWord>>();
+            var sorted = words.OrderBy(w => w.y0).ToList();
+
+            foreach (var word in sorted)
+            {
+                bool added = false;
+                foreach (var line in lines)
+                {
+                    var avgY = line.Average(w => w.MidY);
+                    if (Math.Abs(word.MidY - avgY) <= LineYTolerance)
+                    {
+                        line.Add(word);
+                        added = true;
+                        break;
+                    }
+                }
+                if (!added) lines.Add(new List<ExtractedWord> { word });
+            }
+            return lines;
+        }
+    }
+}
